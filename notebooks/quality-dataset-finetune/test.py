@@ -38,7 +38,7 @@ def collate_fn(batch, tokenizer, max_length=2048):
         tokenizer.apply_chat_template(sample, tokenize=False, add_generation_prompt=False)
         for sample in batch
     ]
-    encodings = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_length, add_special_tokens=False)
+    encodings = tokenizer(prompts, return_tensors="pt", padding=True, truncation=False, add_special_tokens=False)
 
     labels = encodings["input_ids"].clone()
 
