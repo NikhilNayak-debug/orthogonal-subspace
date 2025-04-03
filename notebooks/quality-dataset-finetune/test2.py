@@ -9,17 +9,19 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaConfig
 from datasets import load_dataset, concatenate_datasets
 from tqdm import tqdm
 import numpy as np
-
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Import additional modules for distributed training and FSDP.
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.utils.data.distributed import DistributedSampler
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 torch.autograd.set_detect_anomaly(True)
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 ###################################################
 # 1. Helper Functions for SVD and Parameter Management
@@ -407,7 +409,7 @@ def collate_fn(batch, tokenizer, max_length=2048):
 
 # 5. Training and Saving the SVD Model on Amazon Reviews
 ###################################################
-def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
+def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
 
     train_path = "/new_data/knowledge_rh/quality/training_mix/train_base_extractive_stack.jsonl"
 
@@ -423,52 +425,64 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
 
     # Create datasets and dataloaders
     train_dataset = QualityDataset(train_path, tokenizer)
+    sampler = DistributedSampler(train_dataset, shuffle=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,
+    train_loader = DataLoader(train_dataset, batch_size=8, sampler=sampler,
                             collate_fn=lambda b: collate_fn(b, tokenizer))
     
-    for batch in train_loader:
-        print("Input IDs:", tokenizer.decode(batch['input_ids'][0]))
-        print("Labels:", tokenizer.decode([x for x in batch['labels'][0] if x != -100]))
-        # print(batch['input_ids'][0])
-        # print(batch['labels'][0])
-        break
+    # (Optional) Print one batch for debugging on rank 0.
+    if dist.get_rank() == 0:
+        for batch in train_loader:
+            print("Input IDs:", tokenizer.decode(batch['input_ids'][0]))
+            print("Labels:", tokenizer.decode([x for x in batch['labels'][0] if x != -100]))
+            # print(batch['input_ids'][0])
+            # print(batch['labels'][0])
+            break
 
-    # Load a base LLaMA model to auto-generate the target SVD config.
-    base_model = LlamaWithSVD.from_pretrained(model_name, config=config, svd_config={}, initialize_svd=False)
-    base_model.resize_token_embeddings(len(tokenizer))
-    # Ensure pad_token_id is correctly set
-    base_model.config.pad_token_id = tokenizer.pad_token_id
-    base_model = base_model.to(device, dtype=torch.bfloat16)
-    base_model.gradient_checkpointing_enable()
+    # Load a standard LLaMA model to generate the SVD config.
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        config=config,
+        torch_dtype=torch.bfloat16
+    )
+    base_model = base_model.to(device)
     target_svd_config = auto_generate_target_svd_config(base_model)
-    # target_svd_config = auto_generate_target_svd_config(base_model, tokenizer)
-    print("Auto-generated target SVD config:")
-    for k, v in target_svd_config.items():
-        print(f"  {k}: freeze top {v} singular vectors")
+    if dist.get_rank() == 0:
+        print("Auto-generated target SVD config:")
+        for k, v in target_svd_config.items():
+            print(f"  {k}: freeze top {v} singular vectors")
 
     del base_model
     torch.cuda.empty_cache()
 
     # Initialize our custom SVD model with target_svd_config.
-    model = LlamaWithSVD.from_pretrained(model_name, config=config, svd_config=target_svd_config, initialize_svd=False)
+    model = LlamaWithSVD.from_pretrained(model_name, config=config, svd_config=target_svd_config, initialize_svd=False, torch_dtype=torch.bfloat16)
     model.resize_token_embeddings(len(tokenizer))
     # Ensure pad_token_id is correctly set
     model.config.pad_token_id = tokenizer.pad_token_id
-    model = model.to(device, dtype=torch.bfloat16)
+    model = model.to(device)
     model.reinitialize_svd()
     model.gradient_checkpointing_enable()
+
+    # ----------------------------
+    # FSDP Wrapping:
+    # Wrap the model with FSDP after moving it to the correct device.
+    # ----------------------------
+    model = FSDP(model)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=0.01)
     num_epochs = 5  # adjust as needed
 
     model.train()
     for epoch in range(num_epochs):
+        # Reset the sampler epoch for shuffling.
+        sampler.set_epoch(epoch)
         total_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch", leave=True)
         start_time = time.time()
 
         for batch in progress_bar:
+            # Move batch to the current device.
             for key, val in batch.items():
                 batch[key] = val.to(device)
             outputs = model(**batch, use_cache=False)
@@ -478,9 +492,11 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
             loss.backward()
             model.project_gradients()  # ensure gradients remain in correct subspace
             optimizer.step()
-
-            with open("loss.txt", "a") as f:  # "a" mode appends to the file
-                print(f"Loss: {loss}", file=f)
+            
+            # (Optional) Log loss only on rank 0.
+            if dist.get_rank() == 0:
+                with open("loss.txt", "a") as f:  # "a" mode appends to the file
+                    print(f"Loss: {loss}", file=f)
 
             total_loss += loss.item()
             elapsed_time = time.time() - start_time
@@ -488,21 +504,28 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
             progress_bar.set_postfix(loss=f"{loss.item():.4f}", eta=f"{remaining_time:.2f}s")
 
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
+        if dist.get_rank() == 0:
+            print(f"Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
 
-        # Save model checkpoint after each epoch
-        epoch_model_path = f"{output_model_name}_epoch{epoch+1}.pt"
-        torch.save(model.state_dict(), epoch_model_path)
-        print(f"Model checkpoint saved: {epoch_model_path}")
+            # Save model checkpoint after each epoch only on rank 0.
+            epoch_model_path = f"{output_model_name}_epoch{epoch+1}.pt"
+            torch.save(model.state_dict(), epoch_model_path)
+            print(f"Model checkpoint saved: {epoch_model_path}")
 
-    return model, tokenizer, train_dataset, test_dataset
+    return model, tokenizer, train_dataset, None
 
-###################################################
-# 7. Main
-###################################################
+# ----------------------------
+# 6. Main: Distributed Initialization and Cleanup
+# ----------------------------
 if __name__ == "__main__":
+    # Initialize distributed process group for FSDP.
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
 
-    # Train the model and save it
-    model, tokenizer, train_dataset, test_dataset = train_svd_model(
-        output_model_name=OUTPUT_MODEL_NAME
-    )
+    # Run the training.
+    model, tokenizer, train_dataset, _ = train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=device)
+
+    # (Optional) Clean up the process group.
+    dist.destroy_process_group()
