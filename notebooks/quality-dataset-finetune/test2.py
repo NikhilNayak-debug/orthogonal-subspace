@@ -16,8 +16,9 @@ import numpy as np
 import os
 # Import additional modules for distributed training and FSDP.
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -44,20 +45,21 @@ def decompose_weight_matrix(weight: torch.Tensor, top_k: int):
       }
     """
     device_local = weight.device
-    W = weight.to(torch.float32)  # ensure float32 for SVD
+    # W = weight.to(torch.float32)  # ensure float32 for SVD
+    W = weight.detach().cpu().to(torch.float32)
     U, S, Vt = torch.linalg.svd(W, full_matrices=False)
     # Ensure we don’t ask for more than available
     k = min(top_k, S.shape[0])
 
     # High subspace (frozen)
-    U_high = U[:, :k].detach().to(device_local)
-    S_high = S[:k].detach().to(device_local)
-    V_high = Vt[:k, :].detach().to(device_local)
+    U_high = U[:, :k].detach().to(dtype=torch.bfloat16, device=device_local)
+    S_high = S[:k].detach().to(dtype=torch.bfloat16, device=device_local)
+    V_high = Vt[:k, :].detach().to(dtype=torch.bfloat16, device=device_local)
 
     # Low subspace (trainable)
-    U_low = U[:, k:].detach().to(device_local)
-    S_low = S[k:].detach().to(device_local)
-    V_low = Vt[k:, :].detach().to(device_local)
+    U_low = U[:, k:].detach().to(dtype=torch.bfloat16, device=device_local)
+    S_low = S[k:].detach().to(dtype=torch.bfloat16, device=device_local)
+    V_low = Vt[k:, :].detach().to(dtype=torch.bfloat16, device=device_local)
 
     return {
         "U_high": U_high,
@@ -336,12 +338,12 @@ def auto_generate_target_svd_config(model):
     """
     target_patterns = [
         "self_attn.q_proj",
-        "self_attn.k_proj",
-        "self_attn.v_proj",
-        "self_attn.o_proj",
-        "mlp.gate_proj",
-        "mlp.down_proj",
-        "mlp.up_proj"
+        # "self_attn.k_proj",
+        # "self_attn.v_proj",
+        # "self_attn.o_proj",
+        # "mlp.gate_proj",
+        # "mlp.down_proj",
+        # "mlp.up_proj"
     ]
     config = {}
     for name, param in model.named_parameters():
@@ -427,7 +429,7 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
     train_dataset = QualityDataset(train_path, tokenizer)
     sampler = DistributedSampler(train_dataset, shuffle=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=8, sampler=sampler,
+    train_loader = DataLoader(train_dataset, batch_size=4, sampler=sampler,
                             collate_fn=lambda b: collate_fn(b, tokenizer))
     
     # (Optional) Print one batch for debugging on rank 0.
@@ -442,8 +444,7 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
     # Load a standard LLaMA model to generate the SVD config.
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        config=config,
-        torch_dtype=torch.bfloat16
+        config=config
     )
     base_model = base_model.to(device)
     target_svd_config = auto_generate_target_svd_config(base_model)
@@ -460,7 +461,10 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
     model.resize_token_embeddings(len(tokenizer))
     # Ensure pad_token_id is correctly set
     model.config.pad_token_id = tokenizer.pad_token_id
+
+    # Move the model to the local device.
     model = model.to(device)
+
     model.reinitialize_svd()
     model.gradient_checkpointing_enable()
 
@@ -468,7 +472,7 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
     # FSDP Wrapping:
     # Wrap the model with FSDP after moving it to the correct device.
     # ----------------------------
-    model = FSDP(model)
+    model = FSDP(model, use_orig_params=True, cpu_offload=CPUOffload(offload_params=True), device_id=local_rank)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=0.01)
     num_epochs = 5  # adjust as needed
