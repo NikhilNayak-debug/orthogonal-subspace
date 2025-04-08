@@ -123,16 +123,30 @@ def project_gradient_to_orthogonal_space(svd_dict):
 
     U_high = svd_dict["U_high"]
     V_high = svd_dict["V_high"]
+    U_low  = svd_dict["U_low"]
+    V_low  = svd_dict["V_low"]
 
     if svd_dict["U_low"].grad is not None:
         dU = svd_dict["U_low"].grad
+        if dU.dim() == 1:
+            dU = dU.view(U_high.shape[0], -1)  # reshape to (m, rank_low) 
+        # Now do the projection
+        U_high = U_high.to(dU.device)
         proj = U_high @ (U_high.transpose(0,1) @ dU)
         dU.sub_(proj)
+        # Flatten again if FSDP expects it flattened
+        U_low.grad = dU.view(-1)
 
     if svd_dict["V_low"].grad is not None:
         dV = svd_dict["V_low"].grad
+        if dV.dim() == 1:
+            dV = dV.view(-1, V_high.shape[1])
+        # Now do the projection
+        V_high = V_high.to(dV.device)
         proj = (dV @ V_high.transpose(0,1)) @ V_high
         dV.sub_(proj)
+        # Flatten again if FSDP expects it flattened
+        V_low.grad = dV.view(-1)
     # We leave S_low unchanged
 
 
@@ -286,6 +300,8 @@ class LlamaWithSVD(LlamaForCausalLM):
             #     module._parameters.pop(attr)
             # setattr(module, attr, W)
             # print(module._parameters)
+            target_device = getattr(module, attr).device
+            W = W.to(target_device)
             with torch.no_grad():
                 getattr(module, attr).data.copy_(W)
         return super().forward(*args, **kwargs)
@@ -338,12 +354,12 @@ def auto_generate_target_svd_config(model):
     """
     target_patterns = [
         "self_attn.q_proj",
-        # "self_attn.k_proj",
-        # "self_attn.v_proj",
-        # "self_attn.o_proj",
-        # "mlp.gate_proj",
-        # "mlp.down_proj",
-        # "mlp.up_proj"
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.down_proj",
+        "mlp.up_proj"
     ]
     config = {}
     for name, param in model.named_parameters():
@@ -411,7 +427,7 @@ def collate_fn(batch, tokenizer, max_length=2048):
 
 # 5. Training and Saving the SVD Model on Amazon Reviews
 ###################################################
-def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
+def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None, local_rank=None):
 
     train_path = "/new_data/knowledge_rh/quality/training_mix/train_base_extractive_stack.jsonl"
 
@@ -463,10 +479,10 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=None):
     model.config.pad_token_id = tokenizer.pad_token_id
 
     # Move the model to the local device.
-    model = model.to(device)
+    # model = model.to(device)
 
     model.reinitialize_svd()
-    model.gradient_checkpointing_enable()
+    # model.gradient_checkpointing_enable()
 
     # ----------------------------
     # FSDP Wrapping:
@@ -529,7 +545,7 @@ if __name__ == "__main__":
     device = torch.device("cuda", local_rank)
 
     # Run the training.
-    model, tokenizer, train_dataset, _ = train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=device)
+    model, tokenizer, train_dataset, _ = train_svd_model(output_model_name=OUTPUT_MODEL_NAME, device=device, local_rank=local_rank)
 
     # (Optional) Clean up the process group.
     dist.destroy_process_group()
