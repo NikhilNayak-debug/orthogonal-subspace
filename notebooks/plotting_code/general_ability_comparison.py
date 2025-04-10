@@ -2,12 +2,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Dataset labels
-datasets = ['MMLU', 'GSM', 'BBH', 'TydiQA', 'BoolQA', 'PIQA']
+datasets = ['MMLU', 'GSM', 'BBH', 'TydiQA', 'BoolQA', 'PIQA', 'Average']
 x = np.arange(len(datasets))
 
 # Baseline (from image: pick the one to represent 'Base Instruct Model', e.g., Replay)
-base = [46.56, 26.08, 40.23, 23.47, 70.55, 76.22]  # You can switch to LoRASeqFT or Replay if needed
-ours = [47.69, 7.71, 34.21, 35.81, 76.64, 77.58]      # Your method
+base = [46.56, 26.08, 40.23, 23.47, 70.55, 76.22, 47.18]  # You can switch to LoRASeqFT or Replay if needed
+ours = [47.69, 7.71, 34.21, 35.81, 76.64, 77.58, 46.60]      # Your method
 
 # Bar configuration
 bar_width = 0.35
