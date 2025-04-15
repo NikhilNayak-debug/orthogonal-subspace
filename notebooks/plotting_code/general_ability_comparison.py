@@ -32,6 +32,5 @@ plt.title('General Ability Benchmark Comparison', fontsize=32)
 plt.ylim(0, 85)
 plt.legend(fontsize=28)
 plt.grid(axis='y', linestyle='--', alpha=0.6)
-
 plt.tight_layout()
 plt.savefig("general_ability.pdf", format="pdf", dpi=300, bbox_inches='tight')
