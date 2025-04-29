@@ -321,16 +321,16 @@ def auto_generate_target_svd_config(model):
     target_patterns = [
         "self_attn.q_proj",
         "self_attn.k_proj",
-        # "self_attn.v_proj",
-        # "self_attn.o_proj",
-        # "mlp.gate_proj",
-        # "mlp.down_proj",
-        # "mlp.up_proj"
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.down_proj",
+        "mlp.up_proj"
     ]
     config = {}
     for name, param in model.named_parameters():
         if any(pat in name for pat in target_patterns) and len(param.shape) == 2:
-            top_k = int(np.floor(min(param.shape)*0.20))
+            top_k = int(np.floor(min(param.shape)*0.50))
             full_rank = min(param.shape)
             if top_k >= full_rank:
                 top_k = full_rank - 1
@@ -413,7 +413,7 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
     train_path = "/new_data/knowledge_rh/quality/training_mix/entigraph_knowledge1.0_phi4_first_24_n_5_5_percent.jsonl"
 
     # model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-    model_name = "meta-llama/Llama-2-7b-chat-hf"
+    model_name = "meta-llama/Llama-3.2-3B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # ✅ Add a new pad token if not already present
@@ -464,8 +464,8 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
 
     model.gradient_checkpointing_enable()
 
-    optimizer = optim.AdamW(model.parameters(), lr=5e-6, betas=(0.9, 0.999), weight_decay=0.01)
-    num_epochs = 1  # adjust as needed
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=0.01)
+    num_epochs = 5  # adjust as needed
 
     model.train()
     for epoch in range(num_epochs):
