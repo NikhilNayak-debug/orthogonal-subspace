@@ -99,8 +99,8 @@ def train_model(output_model_name=OUTPUT_MODEL_NAME):
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     config = LlamaConfig.from_pretrained(model_name)
     config.use_cache = False  # if applicable for LLaMA; otherwise remove or adjust
-    config.attention_dropout = 0.2
-    config.hidden_dropout = 0.2
+    # config.attention_dropout = 0.2
+    # config.hidden_dropout = 0.2
 
     # Create datasets and dataloaders
     train_dataset = QualityDataset(train_path, tokenizer)
@@ -119,7 +119,7 @@ def train_model(output_model_name=OUTPUT_MODEL_NAME):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=config,
-        torch_dtype=torch.bfloat16
+        # torch_dtype=torch.bfloat16
     ).to(device)
 
     # Initialize our custom SVD model with target_svd_config.
@@ -129,32 +129,44 @@ def train_model(output_model_name=OUTPUT_MODEL_NAME):
 
     model.gradient_checkpointing_enable()
 
-    optimizer = optim.AdamW(model.parameters(), lr=5e-6, betas=(0.9, 0.999), weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-6, betas=(0.9, 0.95))
+    gradient_accumulation_steps = 128 // 8
     num_epochs = 5  # adjust as needed
 
     model.train()
     for epoch in range(num_epochs):
         total_loss = 0.0
+        optimizer.zero_grad()
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch", leave=True)
         start_time = time.time()
 
-        for batch in progress_bar:
+        for step, batch in enumerate(progress_bar):
             batch = {k: v.to(device) for k, v in batch.items()}  # ✅ key fix
             outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
+            raw_loss = outputs.loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # scale down loss for accumulation
+            (raw_loss / gradient_accumulation_steps).backward()
+
+            # only step/zero_grad every N steps
+            if (step + 1) % gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
             with open("loss.txt", "a") as f:  # "a" mode appends to the file
-                print(f"Loss: {loss}", file=f)
+                print(f"Loss: {raw_loss}", file=f)
 
-            total_loss += loss.item()
+            total_loss += raw_loss.item()
             elapsed_time = time.time() - start_time
             remaining_time = elapsed_time / (progress_bar.n + 1) * (len(train_loader) - progress_bar.n)
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}", eta=f"{remaining_time:.2f}s")
+            progress_bar.set_postfix(loss=f"{raw_loss.item():.4f}", eta=f"{remaining_time:.2f}s")
 
+            torch.cuda.empty_cache()
+
+        # catch any leftover gradients if not divisible exactly
+        if (step + 1) % gradient_accumulation_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
         epoch_model_path = f"{output_model_name}_epoch{epoch+1}.pt"
@@ -164,8 +176,6 @@ def train_model(output_model_name=OUTPUT_MODEL_NAME):
 
         # Clear memory to avoid OOM in next epoch
         torch.cuda.empty_cache()
-        del outputs
-        del loss
 
     return model, tokenizer, train_dataset
 
