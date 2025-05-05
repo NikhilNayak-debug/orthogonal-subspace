@@ -47,14 +47,14 @@ def decompose_weight_matrix(weight: torch.Tensor, top_k: int):
     k = min(top_k, S.shape[0])
 
     # High subspace (frozen)
-    U_high = U[:, :k].detach().to(dtype=torch.bfloat16, device=device_local)
-    S_high = S[:k].detach().to(dtype=torch.bfloat16, device=device_local)
-    V_high = Vt[:k, :].detach().to(dtype=torch.bfloat16, device=device_local)
+    U_high = U[:, :k].detach().to(device=device_local)
+    S_high = S[:k].detach().to(device=device_local)
+    V_high = Vt[:k, :].detach().to(device=device_local)
 
     # Low subspace (trainable)
-    U_low = U[:, k:].detach().to(dtype=torch.bfloat16, device=device_local)
-    S_low = S[k:].detach().to(dtype=torch.bfloat16, device=device_local)
-    V_low = Vt[k:, :].detach().to(dtype=torch.bfloat16, device=device_local)
+    U_low = U[:, k:].detach().to(device=device_local)
+    S_low = S[k:].detach().to(device=device_local)
+    V_low = Vt[k:, :].detach().to(device=device_local)
 
     return {
         "U_high": U_high,
@@ -421,8 +421,6 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     config = LlamaConfig.from_pretrained(model_name)
     config.use_cache = False  # if applicable for LLaMA; otherwise remove or adjust
-    config.attention_dropout = 0.2
-    config.hidden_dropout = 0.2
 
     # Create datasets and dataloaders
     train_dataset = QualityDataset(train_path, tokenizer)
@@ -452,22 +450,24 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
     torch.cuda.empty_cache()
 
     # Initialize our custom SVD model with target_svd_config.
-    model = LlamaWithSVD.from_pretrained(model_name, config=config, svd_config=target_svd_config, initialize_svd=False, torch_dtype=torch.bfloat16)
+    model = LlamaWithSVD.from_pretrained(model_name, config=config, svd_config=target_svd_config, initialize_svd=False)
     model.resize_token_embeddings(len(tokenizer))
     # Ensure pad_token_id is correctly set
     model.config.pad_token_id = tokenizer.pad_token_id
 
     # Move the model to the local device.
-    model = model.to(device, dtype=torch.bfloat16)
+    model = model.to(device)
 
     model.reinitialize_svd()
 
     model.gradient_checkpointing_enable()
 
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-6, betas=(0.9, 0.95))
+    gradient_accumulation_steps = 128 // 8  # =16 micro-batches
     num_epochs = 5  # adjust as needed
 
     model.train()
+    optimizer.zero_grad()  # start accumulation
     for epoch in range(num_epochs):
         total_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch", leave=True)
@@ -490,29 +490,31 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
         # for safe_name in model.svd_params
         # }
 
-        for batch in progress_bar:
+        for step, batch in enumerate(progress_bar):
             for key, val in batch.items():
                 batch[key] = val.to(device)
             outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
+            raw_loss = outputs.loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            model.project_gradients()  # ensure gradients remain in correct subspace
-            optimizer.step()
+            # scale down for accumulation
+            (raw_loss / gradient_accumulation_steps).backward()
+
+            # only step & zero_grad every N steps
+            if (step + 1) % gradient_accumulation_steps == 0:
+                model.project_gradients()
+                optimizer.step()
+                optimizer.zero_grad()
 
             with open("loss.txt", "a") as f:  # "a" mode appends to the file
-                print(f"Loss: {loss}", file=f)
+                print(f"Loss: {raw_loss}", file=f)
 
-            total_loss += loss.item()
+            total_loss += raw_loss.item()
             elapsed_time = time.time() - start_time
             remaining_time = elapsed_time / (progress_bar.n + 1) * (len(train_loader) - progress_bar.n)
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}", eta=f"{remaining_time:.2f}s")
+            progress_bar.set_postfix(loss=f"{raw_loss.item():.4f}", eta=f"{remaining_time:.2f}s")
 
             # Clear memory to avoid OOM in next epoch
             torch.cuda.empty_cache()
-            del outputs
-            del loss
         
         # print("\nChecking low‑rank parameter equality after 1 epoch:")
         # for safe_name, module_svd in model.svd_params.items():
@@ -565,6 +567,12 @@ def train_svd_model(output_model_name=OUTPUT_MODEL_NAME):
         # for name, param in model.named_parameters():
         #     has_grad = param.grad is not None
         #     print(f"{name:60} requires_grad={param.requires_grad:<5} grad_present={has_grad}")
+
+        # catch any leftover if dataset size not divisible by accum_steps
+        if (step + 1) % gradient_accumulation_steps != 0:
+            model.project_gradients()
+            optimizer.step()
+            optimizer.zero_grad()
 
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
