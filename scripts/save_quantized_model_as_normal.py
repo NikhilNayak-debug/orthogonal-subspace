@@ -16,7 +16,7 @@ config    = AutoConfig.from_pretrained(model_name)
 
 # 2. Strip away any quantization settings so __init__ builds a normal Llama
 if hasattr(config, "quantization_config"):
-    config.quantization_config = None
+    delattr(config, "quantization_config")
 for attr in ("quantization_bits", "bits") :
     if hasattr(config, attr):
         delattr(config, attr)
