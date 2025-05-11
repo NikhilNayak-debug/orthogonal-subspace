@@ -6,7 +6,7 @@ import torch.nn as nn
 from compressed_tensors.linear.compressed_linear import CompressedLinear
 from llmcompressor.transformers import SparseAutoModelForCausalLM
 
-save_dir = "check"
+save_dir = "plain"
 
 model_name = "/workspace/Meta-Llama-3.1-8B-Instruct-quantized.w8a16"
 
