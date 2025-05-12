@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, LlamaForCausalLM
 import torch
 import copy
 import torch
@@ -57,11 +57,20 @@ plain = compress_to_plain(model)
 # now cast & move back to GPU (matching the rest of your setup)
 plain = plain.to(dtype=torch.float)
 
+# 5) build a fresh HF Llama and copy weights
+hf = LlamaForCausalLM(config)                       # instantiate from config
+hf.model.load_state_dict(plain.model.state_dict())  # copy the backbone
+hf.lm_head.load_state_dict(plain.lm_head.state_dict())  # copy the head
+hf.tie_weights()                                  # re-tie embeddings & head
+
+# 6) cast & save the HF model
+hf = hf.to(dtype=torch.float32)                     # or .half() if you prefer
+
 # sanity check
 prompt = "### Question:\nWhat is the capital of France?\n### Answer:"
-inputs = tokenizer(prompt, return_tensors="pt").to(plain.device)
+inputs = tokenizer(prompt, return_tensors="pt").to(hf.device)
 with torch.no_grad():
-    out = plain.generate(
+    out = hf.generate(
         **inputs,
         max_new_tokens=32,
         do_sample=False,
@@ -69,4 +78,4 @@ with torch.no_grad():
     )
 print(tokenizer.decode(out[0], skip_special_tokens=True))
 
-plain.save_pretrained(save_dir)
+hf.save_pretrained(save_dir)
